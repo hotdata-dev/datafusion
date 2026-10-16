@@ -1013,6 +1013,10 @@ impl TopKHeap {
         // relevant RecordBatch for that index. `interleave_record_batch` pulls
         // them together into a single new batch
         let new_batch = interleave_record_batch(&record_batches, &indices)?;
+        // `interleave` keeps a view array's data buffers, so a kept row would
+        // still pin the decoded page buffer it came from. Copy the kept
+        // values out instead.
+        let new_batch = gc_view_columns(&new_batch)?;
 
         Ok((Some(new_batch), topk_rows))
     }
@@ -1031,7 +1035,18 @@ impl TopKHeap {
         // Compact when current store memory exceeds 2x what the compacted
         // result would need. The multiplier avoids compacting when the
         // savings would be marginal.
-        if total_rows <= num_rows * 2 {
+        // Compact on bytes as well as rows. A view column's rows point into
+        // decoded page buffers, so a filtered batch can carry a handful of
+        // rows and still keep hundreds of MB alive: a row count alone never
+        // triggers while the store pins every such batch. The kept rows need
+        // their share of the bytes the stored rows actually reference; for a
+        // batch with no view columns that is its row share, and this is the
+        // row condition again.
+        let kept_bytes = (self.store.used_bytes as u128 * num_rows as u128
+            / total_rows.max(1) as u128) as usize;
+        if total_rows <= num_rows * 2
+            && self.store.batches_size <= kept_bytes.saturating_mul(2)
+        {
             return Ok(());
         }
 
@@ -1160,6 +1175,8 @@ struct RecordBatchStore {
     batches_size: usize,
     /// row count of all the batches
     total_rows: usize,
+    /// bytes the stored batches' rows reference (see [`used_batch_bytes`])
+    used_bytes: usize,
 }
 
 impl RecordBatchStore {
@@ -1169,6 +1186,7 @@ impl RecordBatchStore {
             batches: HashMap::new(),
             batches_size: 0,
             total_rows: 0,
+            used_bytes: 0,
         }
     }
 
@@ -1187,6 +1205,7 @@ impl RecordBatchStore {
         if entry.uses > 0 {
             self.batches_size += get_record_batch_memory_size(&entry.batch);
             self.total_rows += entry.batch.num_rows();
+            self.used_bytes += used_batch_bytes(&entry.batch);
             self.batches.insert(entry.id, entry);
         }
     }
@@ -1196,6 +1215,7 @@ impl RecordBatchStore {
         self.batches.clear();
         self.batches_size = 0;
         self.total_rows = 0;
+        self.used_bytes = 0;
     }
 
     fn get(&self, id: u32) -> Option<&RecordBatchEntry> {
@@ -1235,6 +1255,9 @@ impl RecordBatchStore {
                 .total_rows
                 .checked_sub(old_entry.batch.num_rows())
                 .unwrap();
+            self.used_bytes = self
+                .used_bytes
+                .saturating_sub(used_batch_bytes(&old_entry.batch));
         }
     }
 
@@ -1811,10 +1834,59 @@ impl PartitionedTopKRank {
     }
 }
 
+/// `batch`'s memory less the view-column data buffer bytes none of its rows
+/// reference: what its rows would need copied out on their own.
+fn used_batch_bytes(batch: &RecordBatch) -> usize {
+    let unreferenced: usize = batch
+        .columns()
+        .iter()
+        .map(|c| {
+            let (capacity, used) = if let Some(v) = c.as_string_view_opt() {
+                (
+                    buffers_capacity(v.data_buffers()),
+                    v.total_buffer_bytes_used(),
+                )
+            } else if let Some(v) = c.as_binary_view_opt() {
+                (
+                    buffers_capacity(v.data_buffers()),
+                    v.total_buffer_bytes_used(),
+                )
+            } else {
+                (0, 0)
+            };
+            capacity.saturating_sub(used)
+        })
+        .sum();
+    get_record_batch_memory_size(batch).saturating_sub(unreferenced)
+}
+
+fn buffers_capacity(buffers: &[arrow::buffer::Buffer]) -> usize {
+    buffers.iter().map(|b| b.capacity()).sum()
+}
+
+/// `batch` with every top-level view column's values copied into buffers of
+/// their own (`gc`). Nested views are left as they are.
+fn gc_view_columns(batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|c| -> ArrayRef {
+            if let Some(v) = c.as_string_view_opt() {
+                Arc::new(v.gc())
+            } else if let Some(v) = c.as_binary_view_opt() {
+                Arc::new(v.gc())
+            } else {
+                Arc::clone(c)
+            }
+        })
+        .collect();
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{BooleanArray, Float64Array, Int32Array};
+    use arrow::array::{BooleanArray, Float64Array, Int32Array, StringViewBuilder};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_schema::SortOptions;
     use datafusion_common::assert_batches_eq;
@@ -2374,6 +2446,64 @@ mod tests {
     /// compaction heuristic that reintroduce a per-byte estimate
     /// (where integer truncation could misbehave on sub-byte types)
     /// are caught here.
+    /// Filtered batches of a few view rows each point into a large decoded
+    /// buffer. The store must not keep every such buffer alive: memory stays
+    /// near what the kept rows need, not the bytes the scan decoded.
+    #[tokio::test]
+    async fn test_topk_compacts_rows_that_pin_large_view_buffers() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Utf8View,
+            false,
+        )]));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("a", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+        let full_expr = LexOrdering::from([sort_expr.clone()]);
+        let k = 50;
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            vec![],
+            full_expr,
+            k,
+            8192,
+            Arc::new(RuntimeEnv::default()),
+            &ExecutionPlanMetricsSet::new(),
+            Arc::new(RwLock::new(TopKDynamicFilters::new(Arc::new(
+                DynamicFilterPhysicalExpr::new(vec![], lit(true)),
+            )))),
+        )?;
+        let buffer_rows = 10_000;
+        let batches = 50;
+        for b in 0..batches {
+            // One row per batch, sliced out of a ~1 MB buffer; all 50 are
+            // kept, so the row count never says the store is mostly waste.
+            let mut builder = StringViewBuilder::new();
+            for r in 0..buffer_rows {
+                builder.append_value(format!(
+                    "{:08}-{}",
+                    batches - b,
+                    "x".repeat(90 + r % 7)
+                ));
+            }
+            let array = builder.finish().slice(0, 1);
+            topk.insert_batch(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(array) as ArrayRef],
+            )?)?;
+        }
+        let one_buffer = buffer_rows * 100;
+        assert!(
+            topk.heap.store.batches_size < 3 * one_buffer,
+            "the store holds {} bytes, {} buffers' worth",
+            topk.heap.store.batches_size,
+            topk.heap.store.batches_size / one_buffer
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_topk_memory_compaction_skipped_when_marginal() -> Result<()> {
         let schema =
